@@ -22,6 +22,7 @@ git clone https://github.com/your-username/medical-diary-pro.git
 cd medical-diary-pro
 pip install -r requirements.txt
 python run.py
+```
 
 ## ⚠️ **ВАЖНО: Медицинские ограничения**
 
