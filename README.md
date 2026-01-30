@@ -10,6 +10,19 @@
  - 💊 Прием лекарств (прикрутить уведомление, для пациента)
  - 📅 Планирования назначения (можно так же сделать уведомление)
 
+## Technology Stack
+- Python 3.10+
+- PyQt6 for GUI
+- SQLite with encryption
+- AES-GCM for data protection
+
+## Installation
+```bash
+git clone https://github.com/your-username/medical-diary-pro.git
+cd medical-diary-pro
+pip install -r requirements.txt
+python run.py
+
 ## ⚠️ **ВАЖНО: Медицинские ограничения**
 
 Данное программное обеспечение:
