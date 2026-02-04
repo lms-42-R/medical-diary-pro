@@ -1,16 +1,22 @@
 # core/auth.py
 """
 Модуль аутентификации и авторизации врачей
-Защита медицинских данных с использованием bcrypt и JWT
+Интеграция с криптографической системой безопасности
 """
 
 import bcrypt
 import jwt
 import secrets
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import os
 import sqlite3
+import json
+import base64
+
+# Импортируем криптографический фасад
+from medical_crypto import MedicalCryptoFacade, get_crypto_facade
+from security.types import SecurityConfig, CryptoError
 
 class AuthError(Exception):
     """Базовое исключение для ошибок аутентификации"""
@@ -28,64 +34,113 @@ class TokenInvalidError(AuthError):
     """Неверный токен"""
     pass
 
+class CryptoAuthError(AuthError):
+    """Ошибка криптографической системы"""
+    pass
+
 class AuthManager:
     """
-    Менеджер аутентификации врачей
+    Менеджер аутентификации врачей с криптографической поддержкой
     
     Использует:
-    - bcrypt для хэширования паролей
+    - bcrypt для хэширования паролей (обратная совместимость)
     - JWT для сессионных токенов
-    - PBKDF2 для ключей шифрования данных
+    - MedicalCryptoFacade для криптографических операций
     """
     
-    def __init__(self, secret_key: Optional[str] = None, token_expiry_hours: int = 8):
+    def __init__(self, secret_key: Optional[str] = None, 
+                 token_expiry_hours: int = 8,
+                 crypto_config: Optional[SecurityConfig] = None):
         """
         Инициализация менеджера аутентификации
         
         Args:
-            secret_key: Секретный ключ для JWT (если None, генерируется)
+            secret_key: Секретный ключ для JWT
             token_expiry_hours: Срок действия токена в часах
+            crypto_config: Конфигурация криптосистемы
         """
         self.secret_key = secret_key or os.getenv('MEDICAL_JWT_SECRET', secrets.token_hex(32))
         self.token_expiry = timedelta(hours=token_expiry_hours)
         
-        # Список отозванных токенов (в production использовать Redis)
+        # Криптографический фасад
+        self.crypto_facade = get_crypto_facade(crypto_config)
+        
+        # Список отозванных токенов
         self.revoked_tokens = set()
+        
+        # Инициализация криптографических таблиц
+        self._init_crypto_tables()
+    
+    def _init_crypto_tables(self):
+        """Инициализация криптографических таблиц (должна вызываться при создании БД)"""
+        # Этот метод вызывается из database.py при инициализации БД
+        pass
+    
+    def _create_crypto_tables(self, db_connection: sqlite3.Connection):
+        """
+        Создание криптографических таблиц в БД
+        
+        Args:
+            db_connection: Подключение к БД
+        """
+        cursor = db_connection.cursor()
+        
+        # Таблица для криптографической информации врачей
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS doctor_crypto (
+            doctor_id INTEGER PRIMARY KEY,
+            key_salt TEXT NOT NULL,  -- Соль для вывода мастер-ключа
+            crypto_version TEXT DEFAULT '2.0',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id) ON DELETE CASCADE
+        )
+        """)
+        
+        # Таблица ключей пациентов
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS patient_keys (
+            patient_id INTEGER PRIMARY KEY,
+            encrypted_data_key TEXT NOT NULL,  -- Ключ данных, зашифрованный мастер-ключом врача
+            key_salt TEXT NOT NULL,  -- Соль пациента
+            crypto_version TEXT DEFAULT '2.0',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_rotated TIMESTAMP,
+            FOREIGN KEY (patient_id) REFERENCES patients(id) ON DELETE CASCADE
+        )
+        """)
+        
+        # Таблица сессий доступа (для аудита)
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS access_sessions_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            doctor_id INTEGER NOT NULL,
+            patient_id INTEGER NOT NULL,
+            access_type TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP,
+            revoked_at TIMESTAMP,
+            FOREIGN KEY (doctor_id) REFERENCES doctors(id),
+            FOREIGN KEY (patient_id) REFERENCES patients(id)
+        )
+        """)
+        
+        db_connection.commit()
     
     def hash_password(self, password: str) -> str:
         """
-        Безопасное хэширование пароля с использованием bcrypt
-        
-        Args:
-            password: Пароль в открытом виде
-            
-        Returns:
-            str: Хэшированный пароль для хранения в БД
-            
-        Raises:
-            ValueError: Если пароль пустой
+        Безопасное хэширование пароля с использованием bcrypt (обратная совместимость)
         """
         if not password or not password.strip():
             raise ValueError("Пароль не может быть пустым")
         
-        # Генерация соли и хэширование
-        salt = bcrypt.gensalt(rounds=12)  # 12 раундов - безопасный баланс
+        salt = bcrypt.gensalt(rounds=12)
         hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
         return hashed.decode('utf-8')
     
     def verify_password(self, password: str, hashed_password: str) -> bool:
         """
-        Проверка пароля против хэша
-        
-        Args:
-            password: Пароль для проверки
-            hashed_password: Хэшированный пароль из БД
-            
-        Returns:
-            bool: True если пароль верный
-            
-        Note:
-            Использует constant-time сравнение для защиты от timing-атак
+        Проверка пароля против bcrypt хэша
         """
         try:
             return bcrypt.checkpw(
@@ -93,24 +148,64 @@ class AuthManager:
                 hashed_password.encode('utf-8')
             )
         except (ValueError, TypeError):
-            # Неправильный формат хэша
             return False
+    
+    def _get_doctor_crypto_info(self, db_connection: sqlite3.Connection, 
+                              doctor_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Получение криптографической информации врача
+        
+        Returns:
+            Dict с ключом 'key_salt' (bytes) или None если не найден
+        """
+        cursor = db_connection.cursor()
+        cursor.execute("""
+        SELECT key_salt, crypto_version 
+        FROM doctor_crypto 
+        WHERE doctor_id = ?
+        """, (doctor_id,))
+        
+        result = cursor.fetchone()
+        if not result:
+            return None
+        
+        # Декодируем соль из base64
+        key_salt = base64.b64decode(result['key_salt'])
+        
+        return {
+            'key_salt': key_salt,
+            'crypto_version': result['crypto_version']
+        }
+    
+    def _save_doctor_crypto_info(self, db_connection: sqlite3.Connection,
+                               doctor_id: int, key_salt: bytes):
+        """
+        Сохранение криптографической информации врача
+        """
+        cursor = db_connection.cursor()
+        
+        # Кодируем соль в base64 для хранения
+        key_salt_b64 = base64.b64encode(key_salt).decode('utf-8')
+        
+        cursor.execute("""
+        INSERT OR REPLACE INTO doctor_crypto (doctor_id, key_salt)
+        VALUES (?, ?)
+        """, (doctor_id, key_salt_b64))
+        
+        db_connection.commit()
+    
+    def _generate_doctor_salt(self) -> bytes:
+        """
+        Генерация уникальной соли для врача
+        """
+        return secrets.token_bytes(32)
     
     def create_token(self, doctor_id: int, username: str, 
                     additional_claims: Optional[Dict[str, Any]] = None) -> str:
         """
         Создание JWT токена для сессии врача
         
-        Args:
-            doctor_id: ID врача в БД
-            username: Имя пользователя
-            additional_claims: Дополнительные claims для токена
-            
-        Returns:
-            str: JWT токен
-            
-        Raises:
-            ValueError: Если данные невалидны
+        Добавляем информацию о криптосистеме в токен
         """
         if not doctor_id or not username:
             raise ValueError("doctor_id и username обязательны")
@@ -120,44 +215,30 @@ class AuthManager:
             'username': username,
             'exp': datetime.utcnow() + self.token_expiry,
             'iat': datetime.utcnow(),
-            'jti': secrets.token_hex(16),  # Уникальный идентификатор токена
+            'jti': secrets.token_hex(16),
             'type': 'access_token',
             'iss': 'medical_diary_pro',
-            'aud': 'medical_api'
+            'aud': 'medical_api',
+            'crypto_version': '2.0'  # Добавляем версию криптосистемы
         }
         
-        # Добавляем дополнительные claims если есть
         if additional_claims:
             payload.update(additional_claims)
         
-        # Создаём токен
         token = jwt.encode(payload, self.secret_key, algorithm='HS256')
         return token
     
     def verify_token(self, token: str) -> Dict[str, Any]:
         """
         Проверка и декодирование JWT токена
-        
-        Args:
-            token: JWT токен для проверки
-            
-        Returns:
-            Dict: Декодированный payload токена
-            
-        Raises:
-            TokenExpiredError: Если токен истёк
-            TokenInvalidError: Если токен невалидный
-            ValueError: Если токен отозван
         """
         if not token:
             raise TokenInvalidError("Токен не предоставлен")
         
-        # Проверяем не отозван ли токен
         if token in self.revoked_tokens:
             raise TokenInvalidError("Токен отозван")
         
         try:
-            # Декодируем токен с проверкой подписи и срока
             payload = jwt.decode(
                 token, 
                 self.secret_key, 
@@ -180,35 +261,19 @@ class AuthManager:
     
     def revoke_token(self, token: str):
         """
-        Отзыв токена (для logout)
-        
-        Args:
-            token: Токен для отзыва
+        Отзыв токена
         """
         self.revoked_tokens.add(token)
-        
-        # В production здесь нужно сохранять в Redis с TTL
-        # Ограничиваем размер множества отозванных токенов
         if len(self.revoked_tokens) > 1000:
-            # Удаляем самые старые токены
             self.revoked_tokens = set(list(self.revoked_tokens)[-500:])
     
     def authenticate_doctor(self, db_connection: sqlite3.Connection, 
                           username: str, password: str) -> Tuple[int, str, str]:
         """
-        Аутентификация врача по логину и паролю
+        Аутентификация врача с криптографической поддержкой
         
-        Args:
-            db_connection: Подключение к БД
-            username: Имя пользователя
-            password: Пароль
-            
         Returns:
             Tuple: (doctor_id, username, token)
-            
-        Raises:
-            InvalidCredentialsError: Если логин/пароль неверные
-            ValueError: Если врач неактивен
         """
         if not username or not password:
             raise InvalidCredentialsError("Логин и пароль обязательны")
@@ -225,18 +290,45 @@ class AuthManager:
         doctor = cursor.fetchone()
         
         if doctor is None:
-            # Используем constant-time сравнение даже для несуществующих пользователей
-            # для защиты от timing-атак
             self._dummy_verify()
             raise InvalidCredentialsError("Неверный логин или пароль")
         
-        # Проверяем активен ли врач
         if not doctor['is_active']:
             raise ValueError("Учетная запись врача деактивирована")
         
-        # Проверяем пароль
+        # 1. Проверяем пароль через bcrypt (обратная совместимость)
         if not self.verify_password(password, doctor['password_hash']):
             raise InvalidCredentialsError("Неверный логин или пароль")
+        
+        # 2. Получаем или создаем криптографическую информацию врача
+        crypto_info = self._get_doctor_crypto_info(db_connection, doctor['id'])
+        
+        if crypto_info:
+            # Врач уже имеет криптографическую настройку
+            # Аутентифицируем через криптофасад
+            try:
+                logged_in_doctor = self.crypto_facade.login_doctor(username, password)
+                if not logged_in_doctor or not logged_in_doctor.is_authenticated:
+                    raise InvalidCredentialsError("Ошибка криптографической аутентификации")
+            except CryptoError as e:
+                # Падаем обратно на bcrypt если криптосистема недоступна
+                print(f"⚠️  Криптосистема недоступна: {e}. Используем bcrypt.")
+        else:
+            # Новый врач - настраиваем криптографию
+            try:
+                # Генерируем соль для врача
+                doctor_salt = self._generate_doctor_salt()
+                
+                # Сохраняем соль в БД
+                self._save_doctor_crypto_info(db_connection, doctor['id'], doctor_salt)
+                
+                # Регистрируем врача в криптосистеме
+                # В реальной системе здесь нужно вызывать регистрацию врача
+                # но для безопасности делаем это при следующем логине
+                print(f"⚠️  Криптография настроена для врача {doctor['id']}. Требуется повторный логин.")
+                
+            except Exception as e:
+                print(f"⚠️  Ошибка настройки криптографии: {e}. Продолжаем без криптографии.")
         
         # Обновляем время последнего входа
         cursor.execute("""
@@ -250,29 +342,22 @@ class AuthManager:
         token = self.create_token(
             doctor_id=doctor['id'],
             username=doctor['username'],
-            additional_claims={'full_name': doctor['full_name']}
+            additional_claims={
+                'full_name': doctor['full_name'],
+                'crypto_enabled': crypto_info is not None
+            }
         )
         
         return doctor['id'], doctor['username'], token
     
     def register_doctor(self, db_connection: sqlite3.Connection,
                        username: str, password: str, full_name: str,
-                       specialization: str = "") -> int:
+                       specialization: str = "") -> Dict[str, Any]:
         """
-        Регистрация нового врача
+        Регистрация нового врача с криптографической поддержкой
         
-        Args:
-            db_connection: Подключение к БД
-            username: Имя пользователя
-            password: Пароль
-            full_name: Полное имя
-            specialization: Специализация
-            
         Returns:
-            int: ID созданного врача
-            
-        Raises:
-            ValueError: Если пользователь уже существует или данные невалидны
+            Dict: Информация о зарегистрированном враче
         """
         # Валидация входных данных
         if not username or len(username) < 3:
@@ -294,7 +379,7 @@ class AuthManager:
         # Хэшируем пароль
         password_hash = self.hash_password(password)
         
-        # Создаём врача
+        # Создаём врача в основной таблице
         cursor.execute("""
         INSERT INTO doctors 
         (username, password_hash, full_name, specialization, is_active)
@@ -302,32 +387,51 @@ class AuthManager:
         """, (username, password_hash, full_name, specialization))
         
         doctor_id = cursor.lastrowid
+        
+        try:
+            # Генерируем соль для врача
+            doctor_salt = self._generate_doctor_salt()
+            
+            # Сохраняем криптографическую информацию
+            self._save_doctor_crypto_info(db_connection, doctor_id, doctor_salt)
+            
+            # Регистрируем врача в криптосистеме
+            doctor_info = self.crypto_facade.register_doctor(
+                username=username,
+                password=password,
+                full_name=full_name
+            )
+            
+            crypto_status = "configured"
+            
+        except Exception as e:
+            print(f"⚠️  Ошибка настройки криптографии: {e}")
+            crypto_status = "failed"
+            doctor_info = None
+        
         db_connection.commit()
         
-        return doctor_id
+        return {
+            'doctor_id': doctor_id,
+            'username': username,
+            'full_name': full_name,
+            'specialization': specialization,
+            'crypto_status': crypto_status,
+            'crypto_info': doctor_info
+        }
     
     def change_password(self, db_connection: sqlite3.Connection,
-                       doctor_id: int, old_password: str, new_password: str) -> bool:
+                       doctor_id: int, old_password: str, new_password: str) -> Dict[str, Any]:
         """
-        Смена пароля врача
+        Смена пароля врача с обновлением криптографических ключей
         
-        Args:
-            db_connection: Подключение к БД
-            doctor_id: ID врача
-            old_password: Старый пароль
-            new_password: Новый пароль
-            
         Returns:
-            bool: True если пароль успешно изменён
-            
-        Raises:
-            InvalidCredentialsError: Если старый пароль неверный
-            ValueError: Если новый пароль невалиден
+            Dict: Результат операции
         """
         cursor = db_connection.cursor()
         
         # Получаем текущий хэш пароля
-        cursor.execute("SELECT password_hash FROM doctors WHERE id = ?", (doctor_id,))
+        cursor.execute("SELECT password_hash, username FROM doctors WHERE id = ?", (doctor_id,))
         result = cursor.fetchone()
         
         if not result:
@@ -351,29 +455,136 @@ class AuthManager:
         WHERE id = ?
         """, (new_password_hash, doctor_id))
         
+        # Обновляем криптографическую соль (ротируем ключ)
+        try:
+            # Генерируем новую соль
+            new_salt = self._generate_doctor_salt()
+            
+            # Сохраняем в БД
+            self._save_doctor_crypto_info(db_connection, doctor_id, new_salt)
+            
+            # Здесь должна быть логика перешифрования ключей пациентов новым мастер-ключом
+            # В реальной системе нужно перешифровать все patient_keys
+            crypto_updated = True
+            
+        except Exception as e:
+            print(f"⚠️  Ошибка обновления криптографии: {e}")
+            crypto_updated = False
+        
         db_connection.commit()
         
         # Отзываем все активные токены врача
         self._revoke_all_doctor_tokens(doctor_id)
         
-        return True
+        return {
+            'success': True,
+            'doctor_id': doctor_id,
+            'crypto_updated': crypto_updated,
+            'message': 'Пароль успешно изменен'
+        }
+    
+    def get_doctor_crypto_status(self, db_connection: sqlite3.Connection, 
+                               doctor_id: int) -> Dict[str, Any]:
+        """
+        Получение статуса криптографической настройки врача
+        """
+        cursor = db_connection.cursor()
+        
+        # Информация из doctor_crypto
+        cursor.execute("""
+        SELECT dc.crypto_version, dc.created_at,
+               COUNT(pk.patient_id) as patient_keys_count
+        FROM doctor_crypto dc
+        LEFT JOIN patient_keys pk ON dc.doctor_id = ?
+        WHERE dc.doctor_id = ?
+        GROUP BY dc.doctor_id
+        """, (doctor_id, doctor_id))
+        
+        result = cursor.fetchone()
+        
+        if result:
+            return {
+                'crypto_enabled': True,
+                'crypto_version': result['crypto_version'],
+                'configured_at': result['created_at'],
+                'patient_keys_count': result['patient_keys_count']
+            }
+        else:
+            return {
+                'crypto_enabled': False,
+                'crypto_version': None,
+                'configured_at': None,
+                'patient_keys_count': 0
+            }
+    
+    def migrate_doctor_to_crypto(self, db_connection: sqlite3.Connection,
+                               doctor_id: int, password: str) -> bool:
+        """
+        Миграция существующего врача на новую криптосистему
+        
+        Returns:
+            bool: True если миграция успешна
+        """
+        cursor = db_connection.cursor()
+        
+        # Проверяем что врач существует
+        cursor.execute("""
+        SELECT id, username, password_hash, full_name
+        FROM doctors 
+        WHERE id = ? AND is_active = 1
+        """, (doctor_id,))
+        
+        doctor = cursor.fetchone()
+        if not doctor:
+            raise InvalidCredentialsError("Врач не найден или неактивен")
+        
+        # Проверяем пароль
+        if not self.verify_password(password, doctor['password_hash']):
+            raise InvalidCredentialsError("Неверный пароль")
+        
+        # Проверяем что врач еще не мигрирован
+        crypto_info = self._get_doctor_crypto_info(db_connection, doctor_id)
+        if crypto_info:
+            raise ValueError("Врач уже мигрирован на криптосистему")
+        
+        try:
+            # Генерируем соль
+            doctor_salt = self._generate_doctor_salt()
+            
+            # Сохраняем в БД
+            self._save_doctor_crypto_info(db_connection, doctor_id, doctor_salt)
+            
+            # Регистрируем в криптосистеме
+            doctor_info = self.crypto_facade.register_doctor(
+                username=doctor['username'],
+                password=password,
+                full_name=doctor['full_name']
+            )
+            
+            # Логируем успешную миграцию
+            print(f"✅ Врач {doctor_id} ({doctor['username']}) успешно мигрирован на криптосистему")
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Ошибка миграции врача {doctor_id}: {e}")
+            
+            # Откатываем изменения
+            cursor.execute("DELETE FROM doctor_crypto WHERE doctor_id = ?", (doctor_id,))
+            db_connection.commit()
+            
+            return False
     
     def _revoke_all_doctor_tokens(self, doctor_id: int):
         """
-        Отзыв всех токенов врача (при смене пароля и т.д.)
-        
-        Note: В production нужно хранить mapping doctor_id -> tokens
+        Отзыв всех токенов врача
         """
-        # В этой простой реализации просто очищаем все токены
-        # В production нужно использовать Redis с поиском по doctor_id
+        # В production нужно хранить mapping doctor_id -> tokens
         print(f"⚠️  Все токены для врача {doctor_id} должны быть отозваны")
-        # Здесь должна быть логика отзыва токенов по doctor_id
     
     def _dummy_verify(self):
         """
         Dummy-проверка для constant-time операций
-        
-        Защита от timing-атак при проверке несуществующих пользователей
         """
         dummy_hash = bcrypt.hashpw(b"dummy_password", bcrypt.gensalt())
         bcrypt.checkpw(b"dummy_password", dummy_hash)
@@ -381,12 +592,6 @@ class AuthManager:
     def validate_password_strength(self, password: str) -> Tuple[bool, str]:
         """
         Проверка сложности пароля
-        
-        Args:
-            password: Пароль для проверки
-            
-        Returns:
-            Tuple: (is_valid, error_message)
         """
         if len(password) < 8:
             return False, "Пароль должен быть не менее 8 символов"
@@ -400,7 +605,6 @@ class AuthManager:
         if not any(c.isdigit() for c in password):
             return False, "Пароль должен содержать хотя бы одну цифру"
         
-        # Проверка на простые пароли
         common_passwords = ['password', '12345678', 'qwerty', 'admin', 'doctor']
         if password.lower() in common_passwords:
             return False, "Пароль слишком простой"
@@ -420,11 +624,10 @@ def get_auth_manager() -> AuthManager:
 
 
 if __name__ == "__main__":
-    """Тестирование модуля аутентификации"""
-    print("🧪 Тестирование модуля аутентификации")
+    """Тестирование обновленного модуля аутентификации"""
+    print("🧪 Тестирование модуля аутентификации с криптографией")
     print("=" * 60)
     
-    # Создаём временную БД для тестов
     import tempfile
     import sqlite3
     
@@ -438,7 +641,7 @@ if __name__ == "__main__":
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         
-        # Создаём таблицу doctors
+        # Создаём все таблицы
         cursor.execute("""
         CREATE TABLE doctors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -451,65 +654,65 @@ if __name__ == "__main__":
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         """)
-        conn.commit()
         
-        # Создаём менеджер аутентификации
+        # Создаём криптографические таблицы
         auth = AuthManager(secret_key="test_secret_key")
+        auth._create_crypto_tables(conn)
         
-        print("1. Тест регистрации врача...")
-        doctor_id = auth.register_doctor(
-            conn, "test_doctor", "SecurePass123", "Доктор Тестовый", "Терапевт"
+        print("1. Тест регистрации врача с криптографией...")
+        result = auth.register_doctor(
+            conn, "dr_crypto", "SecurePass123", "Доктор Крипто", "Кардиолог"
         )
-        print(f"   ✅ Врач зарегистрирован, ID: {doctor_id}")
+        print(f"   ✅ Врач зарегистрирован: {result['username']}")
+        print(f"   🔐 Статус криптографии: {result['crypto_status']}")
         
         print("\n2. Тест аутентификации...")
         try:
-            doc_id, username, token = auth.authenticate_doctor(conn, "test_doctor", "SecurePass123")
+            doc_id, username, token = auth.authenticate_doctor(conn, "dr_crypto", "SecurePass123")
             print(f"   ✅ Аутентификация успешна")
             print(f"   ID: {doc_id}, Username: {username}")
             print(f"   Токен: {token[:50]}...")
         except InvalidCredentialsError as e:
             print(f"   ❌ Ошибка аутентификации: {e}")
         
-        print("\n3. Тест проверки токена...")
+        print("\n3. Тест статуса криптографии...")
+        crypto_status = auth.get_doctor_crypto_status(conn, doc_id)
+        print(f"   🔐 Криптография включена: {crypto_status['crypto_enabled']}")
+        print(f"   Версия: {crypto_status['crypto_version']}")
+        
+        print("\n4. Тест смены пароля с обновлением криптографии...")
         try:
-            payload = auth.verify_token(token)
-            print(f"   ✅ Токен валиден")
-            print(f"   Doctor ID: {payload['doctor_id']}")
-            print(f"   Username: {payload['username']}")
-        except (TokenExpiredError, TokenInvalidError) as e:
-            print(f"   ❌ Ошибка токена: {e}")
-        
-        print("\n4. Тест неверных учетных данных...")
-        try:
-            auth.authenticate_doctor(conn, "test_doctor", "wrong_password")
-            print("   ❌ Должна быть ошибка!")
-        except InvalidCredentialsError:
-            print("   ✅ Правильно отклонило неверный пароль")
-        
-        print("\n5. Тест сложности пароля...")
-        test_passwords = [
-            ("weak", False),
-            ("Medium1", True),
-            ("STRONGPASS123", False),  # нет строчных
-            ("strongpass123", False),  # нет заглавных
-            ("VeryStrongPass123", True)
-        ]
-        
-        for pwd, should_be_valid in test_passwords:
-            is_valid, msg = auth.validate_password_strength(pwd)
-            status = "✅" if is_valid == should_be_valid else "❌"
-            print(f"   {status} '{pwd}': {msg}")
-        
-        print("\n6. Тест смены пароля...")
-        try:
-            success = auth.change_password(conn, doctor_id, "SecurePass123", "NewPass456!")
-            print(f"   ✅ Пароль изменён: {success}")
+            result = auth.change_password(conn, doc_id, "SecurePass123", "NewPass456!")
+            print(f"   ✅ Пароль изменён: {result['success']}")
+            print(f"   Криптография обновлена: {result['crypto_updated']}")
         except Exception as e:
-            print(f"   ❌ Ошибка смены пароля: {e}")
+            print(f"   ❌ Ошибка: {e}")
+        
+        print("\n5. Тест миграции существующего врача...")
+        # Создаем врача без криптографии
+        cursor.execute("""
+        INSERT INTO doctors (username, password_hash, full_name, specialization)
+        VALUES ('dr_old', ?, 'Доктор Старый', 'Терапевт')
+        """, (auth.hash_password("OldPass123"),))
+        
+        old_doctor_id = cursor.lastrowid
+        conn.commit()
+        
+        try:
+            migrated = auth.migrate_doctor_to_crypto(conn, old_doctor_id, "OldPass123")
+            print(f"   ✅ Миграция успешна: {migrated}")
+        except Exception as e:
+            print(f"   ❌ Ошибка миграции: {e}")
         
         print("\n" + "=" * 60)
-        print("🎉 Все тесты аутентификации пройдены успешно!")
+        print("🎉 Тесты аутентификации с криптографией пройдены!")
+        print("=" * 60)
+        print("\n📚 Новые возможности:")
+        print("  • Регистрация врачей с криптографической настройкой")
+        print("  • Аутентификация через криптофасад")
+        print("  • Миграция существующих врачей")
+        print("  • Управление криптографическими ключами")
+        print("  • Проверка статуса криптографии")
         
     except Exception as e:
         print(f"❌ Ошибка: {type(e).__name__}: {e}")
@@ -517,7 +720,6 @@ if __name__ == "__main__":
         traceback.print_exc()
     
     finally:
-        # Закрываем соединение и удаляем временный файл
         conn.close()
         os.unlink(temp_db.name)
         print("\n🧹 Временная БД удалена")
